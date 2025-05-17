@@ -330,7 +330,7 @@ impl MandelbrotApp {
                 })
                 .collect();
 
-            println!("time elapsed:{}",t0.elapsed());
+            println!("time elapsed:{:?}",t0.elapsed());
             
             ColorImage { size: [width, height], pixels }
         }
