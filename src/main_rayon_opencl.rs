@@ -3,102 +3,11 @@ use egui::ColorImage;
 use eframe::{egui, App};
 use std::sync::{Arc};
 
-use std::time::{Instant, Duration};
-
-const MANDELBROT_KERNEL_DD: &str = r#"
-#pragma OPENCL EXTENSION cl_khr_fp64 : enable
-#pragma OPENCL EXTENSION cl_khr_int64_base_atomics : enable
-
-// A double-double type
-typedef struct { double hi, lo; } dd;
-
-// Split a double into high/low for Dekker
-static inline dd dd_from_double(double a) {
-    return (dd){ a, 0.0 };
-}
-
-// Add two double-doubles
-static inline dd dd_add(dd a, dd b) {
-    double s = a.hi + b.hi;
-    double v = s - a.hi;
-    double t = ((b.hi - v) + (a.hi - (s - v))) + a.lo + b.lo;
-    double z = s + t;
-    return (dd){ z, t - (z - s) };
-}
-
-// Multiply two double-doubles using Dekker/FMA
-static inline dd dd_mul(dd a, dd b) {
-    double p = a.hi * b.hi;
-    double err = fma(a.hi, b.hi, -p) + (a.hi * b.lo + a.lo * b.hi);
-    double z = p + err;
-    return (dd){ z, err - (z - p) };
-}
-
-__kernel void mandelbrot_dd(
-    __global double* output,   // iteration count
-    const int width,
-    const int height,
-    const dd center_x,
-    const dd center_y,
-    const dd scale,
-    const int max_iter
-) {
-    int x = get_global_id(0);
-    int y = get_global_id(1);
-    if (x >= width || y >= height) return;
-    int idx = y * width + x;
-
-    // compute c = center + (pixel/size - 0.5)*scale
-    dd fx = dd_add(dd_from_double(((double)x / width) - 0.5),
-                   (dd){0.0, 0.0});
-    fx = dd_mul(fx, dd_from_double(scale));
-    dd fy = dd_add(dd_from_double(((double)y / height) - 0.5),
-                   (dd){0.0, 0.0});
-    fy = dd_mul(fy, dd_from_double(scale));
-
-    dd cre = dd_add(dd_from_double(center_x), fx);
-    dd cim = dd_add(dd_from_double(center_y), fy);
-
-    dd zr = dd_from_double(0.0);
-    dd zi = dd_from_double(0.0);
-
-    int iter = 0;
-    while (iter < max_iter) {
-        // zr2 = zr*zr, zi2 = zi*zi
-        dd zr2 = dd_mul(zr, zr);
-        dd zi2 = dd_mul(zi, zi);
-
-        dd mag2 = dd_add(zr2, zi2);
-        if (mag2.hi > 4.0) break;
-
-        // zr_new = zr2 - zi2 + cre
-        dd tmp = dd_add(zr2, (dd){-zi2.hi, -zi2.lo});
-        dd zr_new = dd_add(tmp, cre);
-
-        // zi_new = 2*zr*zi + cim
-        dd prod = dd_mul(zr, zi);
-        prod = dd_add(prod, prod); // *2
-        dd zi_new = dd_add(prod, cim);
-
-        zr = zr_new;
-        zi = zi_new;
-
-        // test |z|^2 > 4  ⇒ zr2+zi2 > 4
-       
-
-        iter++;
-    }
-
-    output[idx] = (double)iter;
-}
-"#;
-
-
-
+// OpenCL kernel is unchanged
 const MANDELBROT_KERNEL: &str = r#"
 #pragma OPENCL EXTENSION cl_khr_fp64 : enable
 
-__kernel void mandelbrot(
+__kernel void mandelbrot_dd(
     __global double* output,
     const int width,
     const int height,
@@ -131,11 +40,9 @@ __kernel void mandelbrot(
 }
 "#;
 
-use quad::qag_integration_result;
-
 fn get_color(iter: u32, max_iter: u32) -> [u8; 3] {
     if iter == max_iter { return [0, 0, 0]; }
-    let t = (iter % 256) as f128 / 256.0;
+    let t = (iter % 128) as f64 / 128.0;
     let r = (0.5 + 0.5 * (6.28318 * t).cos()) * 255.0;
     let g = (0.5 + 0.5 * (6.28318 * t + 2.09439).cos()) * 255.0;
     let b = (0.5 + 0.5 * (6.28318 * t + 4.18879).cos()) * 255.0;
@@ -143,15 +50,11 @@ fn get_color(iter: u32, max_iter: u32) -> [u8; 3] {
 }
 
 pub struct MandelbrotApp {
-    center: (f128, f128),
-    zoom: f128,
+    center: (f64, f64),
+    zoom: f64,
     texture: Option<egui::TextureHandle>,
     max_iterations: u32,
     pro_que: Arc<ProQue>,
-    pro_que2: Arc<ProQue>,
-    last_scroll: Instant,
-    last_drag: Instant,
-    render_after_idle: bool,
 }
 
 impl MandelbrotApp {
@@ -160,64 +63,35 @@ impl MandelbrotApp {
             .src(MANDELBROT_KERNEL)
             .build()
             .expect("OpenCL build failed");
-        let pro_que2 = ProQue::builder()
-            .src(MANDELBROT_KERNEL_DD)
-            .build()
-            .expect("OpenCL build failed"); 
-        let now = Instant::now();
-
         Self {
             center: (-0.5, 0.0),
             zoom: 1.0,
             texture: None,
             max_iterations: 2048,
             pro_que: Arc::new(pro_que),
-            pro_que2: Arc::new(pro_que2),
-            last_scroll: now,
-            last_drag: now,
-            render_after_idle: false
         }
     }
 
     /// Renders the *entire* image in one OpenCL dispatch.
-    fn render(&self, width: usize, height: usize, fp128: bool) -> ColorImage {
+    fn render(&self, width: usize, height: usize) -> ColorImage {
         let total_pixels = width * height;
         // 1) Create one big output buffer
-        let (pro_que, kernel_name) = if fp128 {
-            (Arc::clone(&self.pro_que2), "mandelbrot_dd")
-        } else {
-            (Arc::clone(&self.pro_que), "mandelbrot")
-        };
-
         let buffer = Buffer::<f64>::builder()
-            .queue(pro_que.queue().clone())
+            .queue(self.pro_que.queue().clone())
             .len(total_pixels)
             .build()
             .expect("Buffer build");
         // 2) Build kernel with all args
-        if fp128{
-            let kernel = pro_que.kernel_builder(kernel_name)
-                .arg(&buffer)
-                .arg(width as i32)
-                .arg(height as i32)
-                .arg(self.center.0)
-                .arg(self.center.1)
-                .arg(4.0 / self.zoom)           // scale
-                .arg(self.max_iterations as i32)
-                .build()
-                .expect("Kernel build");
-        }else{
-            let kernel = pro_que.kernel_builder(kernel_name)
-                .arg(&buffer)
-                .arg(width as i32)
-                .arg(height as i32)
-                .arg(self.center.0 as f64)
-                .arg(self.center.1 as f64)
-                .arg((4.0 / self.zoom) as f64)           // scale
-                .arg(self.max_iterations as i32)
-                .build()
-                .expect("Kernel build");
-        }
+        let mut kernel = self.pro_que.kernel_builder("mandelbrot_dd")
+            .arg(&buffer)
+            .arg(width as i32)
+            .arg(height as i32)
+            .arg(self.center.0)
+            .arg(self.center.1)
+            .arg(4.0 / self.zoom)           // scale
+            .arg(self.max_iterations as i32)
+            .build()
+            .expect("Kernel build");
         // 3) Enqueue it over the full 2D range
         unsafe {
             kernel.cmd()
@@ -246,23 +120,12 @@ impl MandelbrotApp {
 
 impl App for MandelbrotApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        
-         // 1) Check idle time BEFORE drawing anything
-        let now = Instant::now();
-        let since_scroll = now.duration_since(self.last_scroll);
-        let since_drag   = now.duration_since(self.last_drag);
-        // If 2 seconds have passed since *either* event, and we haven't yet re-rendered,
-        // drop the texture so that the next frame will re-run the kernel.
-        if (since_scroll >= Duration::from_secs(2) || since_drag >= Duration::from_secs(2)) && !self.render_after_idle{
-            self.texture = None;
-            self.render_after_idle = true;
-        }
-
+       
         egui::CentralPanel::default().show(ctx, |ui| {
             let available_size = egui::Vec2::new(512.0, 512.0);
             let size = [available_size.x as usize, available_size.y as usize];
             // Pan with drag (improved)
-              
+            
             // UI Controls
             ui.horizontal(|ui| {
                 ui.label("Iterations:");
@@ -287,7 +150,7 @@ impl App for MandelbrotApp {
             // Mandelbrot rendering
             // Redraw image if window size changes or parameters change
             if self.texture.is_none() || self.texture.as_ref().unwrap().size() != size {
-                let img = self.render(size[0], size[1], self.render_after_idle);
+                let img = self.render(size[0], size[1]);
                 self.texture = Some(ui.ctx().load_texture("mandelbrot", img, Default::default()));
             }
 
@@ -324,8 +187,8 @@ impl App for MandelbrotApp {
                 
                 // Zoom with scroll wheel (anywhere on image)
                 let scroll_delta = ctx.input(|i| i.raw_scroll_delta);
-                //let scroll_delta_x = scroll_delta.x; //scroll x is not detected by OS
-                let scroll_delta_y = scroll_delta.y;     
+                let scroll_delta_x = scroll_delta.x;
+                let scroll_delta_y = scroll_delta.y;//scroll x is not detected by OS          
                 let drag = ctx.input(|i| i.pointer.delta());
                 let drag_x = drag.x;//dreg x is not detected by OS  
                 let drag_y = drag.y;//dreg y is not detected by OS 
@@ -352,8 +215,6 @@ impl App for MandelbrotApp {
                                 self.center.1 = mouse_im - (rel_y - 0.5) as f64 * new_scale;
                                 
                                 need_redraw = true;
-                                self.last_scroll = Instant::now();
-                                self.render_after_idle = false;
                             }
                         }
                 } else {
@@ -365,8 +226,6 @@ impl App for MandelbrotApp {
                         self.center.0 -= drag_x as f64 / size[0] as f64 * scale;
                         self.center.1 -= drag_y as f64 / size[1] as f64 * scale;
                         need_redraw = true;
-                        self.last_drag = Instant::now();
-                        self.render_after_idle = false;
                     }
                 }
                 
