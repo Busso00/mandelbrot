@@ -1,9 +1,11 @@
+#![feature(f128)]
 use ocl::{ProQue, Buffer};
 use egui::ColorImage;
 use eframe::{egui, App};
 use std::sync::{Arc};
-
 use std::time::{Instant, Duration};
+use f128::f128;
+use num_traits::ToPrimitive;
 
 const MANDELBROT_KERNEL_DD: &str = r#"
 #pragma OPENCL EXTENSION cl_khr_fp64 : enable
@@ -34,30 +36,79 @@ static inline dd dd_mul(dd a, dd b) {
     return (dd){ z, err - (z - p) };
 }
 
+static inline dd dd_div(dd a, dd b) {
+    double q1 = a.hi / b.hi;
+
+    // r = a - b*q1
+    dd q1b = dd_mul(dd_from_double(q1), b);
+    dd r = dd_add(a, (dd){ -q1b.hi, -q1b.lo });
+
+    double q2 = r.hi / b.hi;
+
+    double result_hi = q1 + q2;
+    double result_lo = q2 - (result_hi - q1); // error correction
+
+    return (dd){ result_hi, result_lo };
+}
+
+// Returns true if a < b
+static inline int dd_lt(dd a, dd b) {
+    return (a.hi < b.hi) || (a.hi == b.hi && a.lo < b.lo);
+}
+
+// Returns true if a > b
+static inline int dd_gt(dd a, dd b) {
+    return (a.hi > b.hi) || (a.hi == b.hi && a.lo > b.lo);
+}
+
+// Returns true if a == b (optional, if needed)
+static inline int dd_eq(dd a, dd b) {
+    return (a.hi == b.hi) && (a.lo == b.lo);
+}
+
+// Returns true if a <= b
+static inline int dd_le(dd a, dd b) {
+    return dd_lt(a, b) || dd_eq(a, b);
+}
+
+// Returns true if a >= b
+static inline int dd_ge(dd a, dd b) {
+    return dd_gt(a, b) || dd_eq(a, b);
+}
+
+
 __kernel void mandelbrot_dd(
-    __global double* output,   // iteration count
-    const int width,
-    const int height,
-    const dd center_x,
-    const dd center_y,
-    const dd scale,
+    __global int* output,   // iteration count
+    const int width_s,
+    const int height_s,
+    const double center_x_hi,
+    const double center_y_hi,
+    const double scale_hi,
+    const double center_x_lo,
+    const double center_y_lo,
+    const double scale_lo,
     const int max_iter
 ) {
-    int x = get_global_id(0);
-    int y = get_global_id(1);
-    if (x >= width || y >= height) return;
-    int idx = y * width + x;
+    dd center_x = (dd){ center_x_hi, center_x_lo };
+    dd center_y = (dd){ center_y_hi, center_y_lo };
+    dd scale = (dd){ scale_hi, scale_lo };
+    dd x = dd_from_double((double) get_global_id(0));
+    dd y = dd_from_double((double) get_global_id(1));
+    dd width = dd_from_double((double) width_s);
+    dd height = dd_from_double((double) height_s);
+
+    if (dd_ge(x,width) || dd_ge(y,height)) return;
+    int idx = get_global_id(1) * width_s + get_global_id(0);
+
 
     // compute c = center + (pixel/size - 0.5)*scale
-    dd fx = dd_add(dd_from_double(((double)x / width) - 0.5),
-                   (dd){0.0, 0.0});
-    fx = dd_mul(fx, dd_from_double(scale));
-    dd fy = dd_add(dd_from_double(((double)y / height) - 0.5),
-                   (dd){0.0, 0.0});
-    fy = dd_mul(fy, dd_from_double(scale));
+    dd fx = dd_add(dd_div(x, width), (dd) {-0.5,0.0});
+    fx = dd_mul(fx, scale);
+    dd fy = dd_add(dd_div(y, height), (dd) {-0.5,0.0});
+    fy = dd_mul(fy, scale);
 
-    dd cre = dd_add(dd_from_double(center_x), fx);
-    dd cim = dd_add(dd_from_double(center_y), fy);
+    dd cre = dd_add(center_x, fx);
+    dd cim = dd_add(center_y, fy);
 
     dd zr = dd_from_double(0.0);
     dd zi = dd_from_double(0.0);
@@ -89,7 +140,7 @@ __kernel void mandelbrot_dd(
         iter++;
     }
 
-    output[idx] = (double)iter;
+    output[idx] = iter;
 }
 "#;
 
@@ -99,7 +150,7 @@ const MANDELBROT_KERNEL: &str = r#"
 #pragma OPENCL EXTENSION cl_khr_fp64 : enable
 
 __kernel void mandelbrot(
-    __global double* output,
+    __global int* output,
     const int width,
     const int height,
     const double center_x,
@@ -127,15 +178,15 @@ __kernel void mandelbrot(
         iter++;
     }
 
-    output[index] = (double)iter;
+    output[index] = iter;
 }
 "#;
 
-use quad::qag_integration_result;
 
-fn get_color(iter: u32, max_iter: u32) -> [u8; 3] {
+fn get_color(iter: i32, max_iter: i32) -> [u8; 3] {
     if iter == max_iter { return [0, 0, 0]; }
-    let t = (iter % 256) as f128 / 256.0;
+    let t = (iter % 256) as f32 / 256.0;
+
     let r = (0.5 + 0.5 * (6.28318 * t).cos()) * 255.0;
     let g = (0.5 + 0.5 * (6.28318 * t + 2.09439).cos()) * 255.0;
     let b = (0.5 + 0.5 * (6.28318 * t + 4.18879).cos()) * 255.0;
@@ -146,13 +197,20 @@ pub struct MandelbrotApp {
     center: (f128, f128),
     zoom: f128,
     texture: Option<egui::TextureHandle>,
-    max_iterations: u32,
+    max_iterations: i32,
     pro_que: Arc<ProQue>,
     pro_que2: Arc<ProQue>,
     last_scroll: Instant,
     last_drag: Instant,
     render_after_idle: bool,
 }
+
+fn split_f128_to_dd(val: f128) -> (f64, f64) {
+    let hi = val.to_f64().unwrap_or(0.0); // Convert to f64, losing precision
+    let lo = (val - f128::from(hi)).to_f64().unwrap_or(0.0); // Remainder as low part
+    (hi, lo)
+}
+
 
 impl MandelbrotApp {
     pub fn new() -> Self {
@@ -167,8 +225,8 @@ impl MandelbrotApp {
         let now = Instant::now();
 
         Self {
-            center: (-0.5, 0.0),
-            zoom: 1.0,
+            center: (f128::from(-0.5), f128::from(0.0)),
+            zoom: f128::from(1.0),
             texture: None,
             max_iterations: 2048,
             pro_que: Arc::new(pro_que),
@@ -189,56 +247,94 @@ impl MandelbrotApp {
             (Arc::clone(&self.pro_que), "mandelbrot")
         };
 
-        let buffer = Buffer::<f64>::builder()
+        let buffer = Buffer::<i32>::builder()
             .queue(pro_que.queue().clone())
             .len(total_pixels)
             .build()
             .expect("Buffer build");
         // 2) Build kernel with all args
-        if fp128{
-            let kernel = pro_que.kernel_builder(kernel_name)
-                .arg(&buffer)
-                .arg(width as i32)
-                .arg(height as i32)
-                .arg(self.center.0)
-                .arg(self.center.1)
-                .arg(4.0 / self.zoom)           // scale
-                .arg(self.max_iterations as i32)
-                .build()
-                .expect("Kernel build");
-        }else{
-            let kernel = pro_que.kernel_builder(kernel_name)
-                .arg(&buffer)
-                .arg(width as i32)
-                .arg(height as i32)
-                .arg(self.center.0 as f64)
-                .arg(self.center.1 as f64)
-                .arg((4.0 / self.zoom) as f64)           // scale
-                .arg(self.max_iterations as i32)
-                .build()
-                .expect("Kernel build");
-        }
-        // 3) Enqueue it over the full 2D range
-        unsafe {
-            kernel.cmd()
-                .global_work_size([width, height])
-                .local_work_size([16, 16])   // 16×16 = 256 threads per group
-                .enq()
-                .expect("Kernel enqueue");
-        }
-        // 4) Read back all pixels
-        let mut raw = vec![0.0f64; total_pixels];
-        buffer.read(&mut raw).enq().expect("Read buffer");
-        // 5) Convert to egui::Color32
-        let pixels = raw.into_iter()
-            .map(|v| {
-                let it = v as u32;
-                let [r,g,b] = get_color(it, self.max_iterations);
-                egui::Color32::from_rgb(r,g,b)
-            })
-            .collect();
 
-        ColorImage { size: [width, height], pixels }
+        let t0 = Instant::now();
+
+        if fp128{
+            println!("high res");
+            let (center_x_hi, center_x_lo) = split_f128_to_dd(self.center.0);
+            let (center_y_hi, center_y_lo) = split_f128_to_dd(self.center.1);
+            let (scale_hi, scale_lo)       = split_f128_to_dd(f128::from(4.0) / self.zoom);
+            let kernel = pro_que.kernel_builder(kernel_name)
+                .arg(&buffer)
+                .arg(width as i32)
+                .arg(height as i32)
+                .arg(center_x_hi)
+                .arg(center_y_hi)
+                .arg(scale_hi)
+                .arg(center_x_lo)
+                .arg(center_y_lo)
+                .arg(scale_lo)           // scale
+                .arg(self.max_iterations as i32)
+                .build()
+                .expect("Kernel build");
+            // 3) Enqueue it over the full 2D range
+            unsafe {
+                kernel.cmd()
+                    .global_work_size([width, height])
+                    .local_work_size([16, 16])   // 16×16 = 256 threads per group
+                    .enq()
+                    .expect("Kernel enqueue");
+            }
+            // 4) Read back all pixels
+            let mut raw = vec![0i32; total_pixels];
+            buffer.read(&mut raw).enq().expect("Read buffer");
+            // 5) Convert to egui::Color32
+            let pixels = raw.into_iter()
+                .map(|v| {
+                    let it = v as i32;
+                    let [r,g,b] = get_color(it, self.max_iterations);
+                    egui::Color32::from_rgb(r,g,b)
+                })
+                .collect();
+            
+            println!("time elapsed:{:?}",t0.elapsed());
+
+            ColorImage { size: [width, height], pixels }
+        }else{
+            println!("low res");
+            
+            let kernel = pro_que.kernel_builder(kernel_name)
+                .arg(&buffer)
+                .arg(width as i32)
+                .arg(height as i32)
+                .arg(self.center.0.to_f64().unwrap())
+                .arg(self.center.1.to_f64().unwrap())
+                .arg(4.0 / self.zoom.to_f64().unwrap())           // scale
+                .arg(self.max_iterations as i32)
+                .build()
+                .expect("Kernel build");
+            // 3) Enqueue it over the full 2D range
+            unsafe {
+                kernel.cmd()
+                    .global_work_size([width, height])
+                    .local_work_size([16, 16])   // 16×16 = 256 threads per group
+                    .enq()
+                    .expect("Kernel enqueue");
+            }
+            // 4) Read back all pixels
+            let mut raw = vec![0i32; total_pixels];
+            buffer.read(&mut raw).enq().expect("Read buffer");
+            // 5) Convert to egui::Color32
+            let pixels = raw.into_iter()
+                .map(|v| {
+                    let it = v as i32;
+                    let [r,g,b] = get_color(it, self.max_iterations);
+                    egui::Color32::from_rgb(r,g,b)
+                })
+                .collect();
+
+            println!("time elapsed:{}",t0.elapsed());
+            
+            ColorImage { size: [width, height], pixels }
+        }
+        
     }
 }
 
@@ -274,12 +370,12 @@ impl App for MandelbrotApp {
                 
                 ui.separator();
                 
-                ui.label(format!("Zoom: {:.2}x", self.zoom));
-                ui.label(format!("Center: ({:.6}, {:.6})", self.center.0, self.center.1));
+                ui.label(format!("Zoom: {:.2}x", self.zoom.to_f64().unwrap()));
+                ui.label(format!("Center: ({:.6}, {:.6})", self.center.0.to_f64().unwrap(), self.center.1.to_f64().unwrap()));
                 
                 if ui.button("Reset View").clicked() {
-                    self.center = (-0.5, 0.0);
-                    self.zoom = 1.0;
+                    self.center = (f128::from(-0.5), f128::from(0.0));
+                    self.zoom = f128::from(1.0);
                     self.texture = None;
                 }
             });
@@ -299,7 +395,7 @@ impl App for MandelbrotApp {
                 
                 
                 // Pan with arrow keys (always available)
-                let pan_speed = 0.05 / self.zoom;
+                let pan_speed = f128::from(0.05) / self.zoom;
                 ctx.input(|i| {
                     if i.key_pressed(egui::Key::ArrowLeft) {
                         self.center.0 -= pan_speed;
@@ -336,20 +432,20 @@ impl App for MandelbrotApp {
                         if is_hovered {
                             
                                 // Calculate position in fractal space before zoom
-                                let rel_x = (pointer_pos.x - ui.min_rect().left()) / available_size.x;
-                                let rel_y = (pointer_pos.y - ui.min_rect().top()) / available_size.y;
-                                let scale = 4.0 / self.zoom;
-                                let mouse_re = self.center.0 + (rel_x - 0.5) as f64 * scale;
-                                let mouse_im = self.center.1 + (rel_y - 0.5) as f64 * scale;
+                                let rel_x = f128::from((pointer_pos.x - ui.min_rect().left()) / available_size.x);
+                                let rel_y = f128::from((pointer_pos.y - ui.min_rect().top()) / available_size.y);
+                                let scale = f128::from(4.0) / self.zoom;
+                                let mouse_re = self.center.0 + (rel_x - f128::from(0.5)) * scale;
+                                let mouse_im = self.center.1 + (rel_y - f128::from(0.5)) * scale;
                                 
                                 // Apply zoom
                                 let zoom_delta = 1.1f64.powf(scroll_delta_y as f64 * 0.1);
-                                self.zoom *= zoom_delta;
+                                self.zoom *= f128::from(zoom_delta);
                                 
                                 // Adjust center to keep mouse position fixed on the same fractal point
-                                let new_scale = 4.0 / self.zoom;
-                                self.center.0 = mouse_re - (rel_x - 0.5) as f64 * new_scale;
-                                self.center.1 = mouse_im - (rel_y - 0.5) as f64 * new_scale;
+                                let new_scale = f128::from(4.0) / self.zoom;
+                                self.center.0 = mouse_re - (rel_x - f128::from(0.5)) * new_scale;
+                                self.center.1 = mouse_im - (rel_y - f128::from(0.5)) * new_scale;
                                 
                                 need_redraw = true;
                                 self.last_scroll = Instant::now();
@@ -360,10 +456,10 @@ impl App for MandelbrotApp {
                     // Not scrolling
 
                     if (drag_x != 0.0 || drag_y != 0.0) &&  ctx.input(|i| i.pointer.is_decidedly_dragging()) {
-                        let scale = 4.0 / self.zoom;
+                        let scale = f128::from(4.0) / self.zoom;
                         // Convert f32 drag values to f64 for calculation
-                        self.center.0 -= drag_x as f64 / size[0] as f64 * scale;
-                        self.center.1 -= drag_y as f64 / size[1] as f64 * scale;
+                        self.center.0 -= f128::from(drag_x) / f128::from(size[0]) as f128 * scale;
+                        self.center.1 -= f128::from(drag_y) / f128::from(size[1]) * scale;
                         need_redraw = true;
                         self.last_drag = Instant::now();
                         self.render_after_idle = false;
@@ -393,6 +489,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Mandelbrot",
         native_options,
-        Box::new(|_cc| Box::new(MandelbrotApp::new())),
+        Box::new(|_cc| Ok(Box::new(MandelbrotApp::new()))),
     )
 }
