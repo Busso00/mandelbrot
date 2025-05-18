@@ -1,4 +1,3 @@
-#![feature(f128)]
 use ocl::{ProQue, Buffer};
 use egui::ColorImage;
 use eframe::{egui, App};
@@ -87,18 +86,26 @@ __kernel void mandelbrot_dd(
     const double center_x_lo,
     const double center_y_lo,
     const double scale_lo,
-    const int max_iter
+    const int max_iter,
+    const int flag
 ) {
+    int x_s = get_global_id(0);
+    int y_s = get_global_id(1);
+    int idx = y_s * width_s + x_s;
+    
+    if (flag && (((x_s % 4) != 0) && ((y_s % 4) != 0))) {
+        output[idx] = output[(y_s/4)*4 * width_s + (x_s/4)*4];
+    }
+
     dd center_x = (dd){ center_x_hi, center_x_lo };
     dd center_y = (dd){ center_y_hi, center_y_lo };
     dd scale = (dd){ scale_hi, scale_lo };
-    dd x = dd_from_double((double) get_global_id(0));
-    dd y = dd_from_double((double) get_global_id(1));
+    dd x = dd_from_double((double) x_s);
+    dd y = dd_from_double((double) y_s);
     dd width = dd_from_double((double) width_s);
     dd height = dd_from_double((double) height_s);
 
     if (dd_ge(x,width) || dd_ge(y,height)) return;
-    int idx = get_global_id(1) * width_s + get_global_id(0);
 
 
     // compute c = center + (pixel/size - 0.5)*scale
@@ -146,42 +153,6 @@ __kernel void mandelbrot_dd(
 
 
 
-const MANDELBROT_KERNEL: &str = r#"
-#pragma OPENCL EXTENSION cl_khr_fp64 : enable
-
-__kernel void mandelbrot(
-    __global int* output,
-    const int width,
-    const int height,
-    const double center_x,
-    const double center_y,
-    const double scale,
-    const int max_iter
-) {
-    int x = get_global_id(0);
-    int y = get_global_id(1);
-    if (x >= width || y >= height) return;
-    int index = y * width + x;
-
-    double fx = (double)x / (double)width - 0.5;
-    double fy = (double)y / (double)height - 0.5;
-
-    double re = center_x + fx * scale;
-    double im = center_y + fy * scale;
-    double zr = 0.0, zi = 0.0, zr2 = 0.0, zi2 = 0.0;
-    int iter = 0;
-    while (zr2 + zi2 <= 4.0 && iter < max_iter) {
-        zi = 2.0 * zr * zi + im;
-        zr = zr2 - zi2 + re;
-        zr2 = zr * zr;
-        zi2 = zi * zi;
-        iter++;
-    }
-
-    output[index] = iter;
-}
-"#;
-
 
 fn get_color(iter: i32, max_iter: i32) -> [u8; 3] {
     if iter == max_iter { return [0, 0, 0]; }
@@ -199,7 +170,6 @@ pub struct MandelbrotApp {
     texture: Option<egui::TextureHandle>,
     max_iterations: i32,
     pro_que: Arc<ProQue>,
-    pro_que2: Arc<ProQue>,
     last_scroll: Instant,
     last_drag: Instant,
     render_after_idle: bool,
@@ -215,13 +185,10 @@ fn split_f128_to_dd(val: f128) -> (f64, f64) {
 impl MandelbrotApp {
     pub fn new() -> Self {
         let pro_que = ProQue::builder()
-            .src(MANDELBROT_KERNEL)
-            .build()
-            .expect("OpenCL build failed");
-        let pro_que2 = ProQue::builder()
             .src(MANDELBROT_KERNEL_DD)
             .build()
-            .expect("OpenCL build failed"); 
+            .expect("OpenCL build failed");
+         
         let now = Instant::now();
 
         Self {
@@ -230,7 +197,6 @@ impl MandelbrotApp {
             texture: None,
             max_iterations: 2048,
             pro_que: Arc::new(pro_que),
-            pro_que2: Arc::new(pro_que2),
             last_scroll: now,
             last_drag: now,
             render_after_idle: false
@@ -241,14 +207,9 @@ impl MandelbrotApp {
     fn render(&self, width: usize, height: usize, fp128: bool) -> ColorImage {
         let total_pixels = width * height;
         // 1) Create one big output buffer
-        let (pro_que, kernel_name) = if fp128 {
-            (Arc::clone(&self.pro_que2), "mandelbrot_dd")
-        } else {
-            (Arc::clone(&self.pro_que), "mandelbrot")
-        };
 
         let buffer = Buffer::<i32>::builder()
-            .queue(pro_que.queue().clone())
+            .queue(self.pro_que.queue().clone())
             .len(total_pixels)
             .build()
             .expect("Buffer build");
@@ -256,84 +217,47 @@ impl MandelbrotApp {
 
         let t0 = Instant::now();
 
-        if fp128{
-            println!("high res");
-            let (center_x_hi, center_x_lo) = split_f128_to_dd(self.center.0);
-            let (center_y_hi, center_y_lo) = split_f128_to_dd(self.center.1);
-            let (scale_hi, scale_lo)       = split_f128_to_dd(f128::from(4.0) / self.zoom);
-            let kernel = pro_que.kernel_builder(kernel_name)
-                .arg(&buffer)
-                .arg(width as i32)
-                .arg(height as i32)
-                .arg(center_x_hi)
-                .arg(center_y_hi)
-                .arg(scale_hi)
-                .arg(center_x_lo)
-                .arg(center_y_lo)
-                .arg(scale_lo)           // scale
-                .arg(self.max_iterations as i32)
-                .build()
-                .expect("Kernel build");
-            // 3) Enqueue it over the full 2D range
-            unsafe {
-                kernel.cmd()
-                    .global_work_size([width, height])
-                    .local_work_size([16, 16])   // 16×16 = 256 threads per group
-                    .enq()
-                    .expect("Kernel enqueue");
-            }
-            // 4) Read back all pixels
-            let mut raw = vec![0i32; total_pixels];
-            buffer.read(&mut raw).enq().expect("Read buffer");
-            // 5) Convert to egui::Color32
-            let pixels = raw.into_iter()
-                .map(|v| {
-                    let it = v as i32;
-                    let [r,g,b] = get_color(it, self.max_iterations);
-                    egui::Color32::from_rgb(r,g,b)
-                })
-                .collect();
-            
-            println!("time elapsed:{:?}",t0.elapsed());
-
-            ColorImage { size: [width, height], pixels }
-        }else{
-            println!("low res");
-            
-            let kernel = pro_que.kernel_builder(kernel_name)
-                .arg(&buffer)
-                .arg(width as i32)
-                .arg(height as i32)
-                .arg(self.center.0.to_f64().unwrap())
-                .arg(self.center.1.to_f64().unwrap())
-                .arg(4.0 / self.zoom.to_f64().unwrap())           // scale
-                .arg(self.max_iterations as i32)
-                .build()
-                .expect("Kernel build");
-            // 3) Enqueue it over the full 2D range
-            unsafe {
-                kernel.cmd()
-                    .global_work_size([width, height])
-                    .local_work_size([16, 16])   // 16×16 = 256 threads per group
-                    .enq()
-                    .expect("Kernel enqueue");
-            }
-            // 4) Read back all pixels
-            let mut raw = vec![0i32; total_pixels];
-            buffer.read(&mut raw).enq().expect("Read buffer");
-            // 5) Convert to egui::Color32
-            let pixels = raw.into_iter()
-                .map(|v| {
-                    let it = v as i32;
-                    let [r,g,b] = get_color(it, self.max_iterations);
-                    egui::Color32::from_rgb(r,g,b)
-                })
-                .collect();
-
-            println!("time elapsed:{:?}",t0.elapsed());
-            
-            ColorImage { size: [width, height], pixels }
+        
+        let (center_x_hi, center_x_lo) = split_f128_to_dd(self.center.0);
+        let (center_y_hi, center_y_lo) = split_f128_to_dd(self.center.1);
+        let (scale_hi, scale_lo)       = split_f128_to_dd(f128::from(4.0) / self.zoom);
+        let kernel = self.pro_que.kernel_builder("mandelbrot_dd")
+            .arg(&buffer)
+            .arg(width as i32)
+            .arg(height as i32)
+            .arg(center_x_hi)
+            .arg(center_y_hi)
+            .arg(scale_hi)
+            .arg(center_x_lo)
+            .arg(center_y_lo)
+            .arg(scale_lo)           // scale
+            .arg(self.max_iterations as i32)
+            .arg((!fp128) as i32)
+            .build()
+            .expect("Kernel build");
+        // 3) Enqueue it over the full 2D range
+        unsafe {
+            kernel.cmd()
+                .global_work_size([width, height])
+                .local_work_size([16, 16])   // 16×16 = 256 threads per group
+                .enq()
+                .expect("Kernel enqueue");
         }
+        // 4) Read back all pixels
+        let mut raw = vec![0i32; total_pixels];
+        buffer.read(&mut raw).enq().expect("Read buffer");
+        // 5) Convert to egui::Color32
+        let pixels = raw.into_iter()
+            .map(|v| {
+                let it = v as i32;
+                let [r,g,b] = get_color(it, self.max_iterations);
+                egui::Color32::from_rgb(r,g,b)
+            })
+            .collect();
+            
+        println!("time elapsed:{:?}",t0.elapsed());
+
+        ColorImage { size: [width, height], pixels }
         
     }
 }
