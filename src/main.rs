@@ -274,7 +274,10 @@ impl MandelbrotApp {
         let t0 = Instant::now();
         
         let scale = f128::from(4.0) / self.zoom;
-    
+        
+        let n_threads = rayon::current_num_threads();
+        println!("Rayon will run {} threads in parallel.", n_threads);
+
         // Pre-allocate the pixels vector
         let mut pixels = vec![egui::Color32::BLACK; w * h];
 
@@ -368,7 +371,7 @@ impl MandelbrotApp {
             return self.render_mt(w, h);
         }else{
             //render with GPU
-            return self.render_mt(w, h);
+            return self.render_gpu(w, h);
         }
     }
 }
