@@ -5,6 +5,8 @@ use std::sync::{Arc};
 use std::time::{Instant, Duration};
 use f128::f128;
 use num_traits::ToPrimitive;
+use rayon::prelude::*;
+use std::mem;
 
 const MANDELBROT_KERNEL_DD: &str = r#"
 #pragma OPENCL EXTENSION cl_khr_fp64 : enable
@@ -86,16 +88,11 @@ __kernel void mandelbrot_dd(
     const double center_x_lo,
     const double center_y_lo,
     const double scale_lo,
-    const int max_iter,
-    const int flag
+    const int max_iter
 ) {
     int x_s = get_global_id(0);
     int y_s = get_global_id(1);
     int idx = y_s * width_s + x_s;
-    
-    if (flag && (((x_s % 4) != 0) && ((y_s % 4) != 0))) {
-        output[idx] = output[(y_s/4)*4 * width_s + (x_s/4)*4];
-    }
 
     dd center_x = (dd){ center_x_hi, center_x_lo };
     dd center_y = (dd){ center_y_hi, center_y_lo };
@@ -127,6 +124,9 @@ __kernel void mandelbrot_dd(
         dd zi2 = dd_mul(zi, zi);
 
         dd mag2 = dd_add(zr2, zi2);
+
+        // test |z|^2 > 4  ⇒ zr2+zi2 > 4
+       
         if (mag2.hi > 4.0) break;
 
         // zr_new = zr2 - zi2 + cre
@@ -141,8 +141,7 @@ __kernel void mandelbrot_dd(
         zr = zr_new;
         zi = zi_new;
 
-        // test |z|^2 > 4  ⇒ zr2+zi2 > 4
-       
+        
 
         iter++;
     }
@@ -152,6 +151,76 @@ __kernel void mandelbrot_dd(
 "#;
 
 
+// Define a struct to hold 128-bit float bits with endianness awareness
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct F128Bits {
+    lo: u64, // least significant bits
+    hi: u64, // most significant bits
+}
+
+// Extract bits from __float128 (assuming __float128 is a C type)
+
+fn float128_to_bits(f: f128) -> F128Bits {
+    unsafe { mem::transmute_copy(&f) }
+}
+
+fn float128_to_ordered(bits: &mut F128Bits) {
+    let sign = bits.hi >> 63;
+    if sign != 0 {
+        bits.hi = !bits.hi;
+        bits.lo = !bits.lo;
+    } else {
+        bits.hi |= 0x8000000000000000;
+    }
+}
+
+fn f128_eq(a: f128, b: f128) -> bool {
+    let ba = float128_to_bits(a);
+    let bb = float128_to_bits(b);
+    ba == bb
+}
+
+fn f128_lt(a: f128, b: f128) -> bool {
+    let mut ba = float128_to_bits(a);
+    let mut bb = float128_to_bits(b);
+    float128_to_ordered(&mut ba);
+    float128_to_ordered(&mut bb);
+    (ba.hi < bb.hi) || (ba.hi == bb.hi && ba.lo < bb.lo)
+}
+
+fn f128_cmp(a: f128, b: f128) -> i32 {
+    if f128_lt(a, b) {
+        -1
+    } else if f128_eq(a, b) {
+        0
+    } else {
+        1
+    }
+}
+
+
+fn mandelbrot_mt(c_re: f128, c_im: f128, max_iter: i32) -> i32 {
+    let mut z_re = f128::from(0.0);
+    let mut z_im = f128::from(0.0);
+    let mut iter = 0 as i32;
+    let mut z_re2 = f128::from(0.0);
+    let mut z_im2 = f128::from(0.0);
+    let four = f128::from(4.0);
+
+    
+    while ((f128_cmp(z_re2 + z_im2,four)) < 0) && (iter < max_iter) {
+        let new_re = z_re2 - z_im2 + c_re;
+        let z_reim = z_re * z_im;
+        let new_im =  z_reim + z_reim + c_im;
+        z_re = new_re;
+        z_im = new_im;
+        z_re2 = z_re * z_re;
+        z_im2 = z_im * z_im;
+        iter += 1;
+    }
+    iter
+}
 
 
 fn get_color(iter: i32, max_iter: i32) -> [u8; 3] {
@@ -170,9 +239,8 @@ pub struct MandelbrotApp {
     texture: Option<egui::TextureHandle>,
     max_iterations: i32,
     pro_que: Arc<ProQue>,
-    last_scroll: Instant,
-    last_drag: Instant,
-    render_after_idle: bool,
+    t_mt: Duration,
+    t_gpu: Duration
 }
 
 fn split_f128_to_dd(val: f128) -> (f64, f64) {
@@ -189,22 +257,54 @@ impl MandelbrotApp {
             .build()
             .expect("OpenCL build failed");
          
-        let now = Instant::now();
-
+        
         Self {
             center: (f128::from(-0.5), f128::from(0.0)),
             zoom: f128::from(1.0),
             texture: None,
             max_iterations: 2048,
             pro_que: Arc::new(pro_que),
-            last_scroll: now,
-            last_drag: now,
-            render_after_idle: false
+            t_mt: Duration::ZERO,
+            t_gpu: Duration::ZERO
         }
     }
 
+        
+    fn render_mt(&mut self, w: usize, h:usize) -> ColorImage {
+        let t0 = Instant::now();
+        
+        let scale = f128::from(4.0) / self.zoom;
+    
+        // Pre-allocate the pixels vector
+        let mut pixels = vec![egui::Color32::BLACK; w * h];
+
+        // Parallel iteration over each pixel
+        pixels.par_iter_mut().enumerate().for_each(|(i, pixel)| {
+            let x = i % w;
+            let y = i / w;
+
+            let re = self.center.0 + (f128::from(x) / f128::from(w) - f128::from(0.5)) * scale;
+            let im = self.center.1 + (f128::from(y) / f128::from(h) - f128::from(0.5)) * scale;
+
+            let iter = mandelbrot_mt(re, im, self.max_iterations);
+
+            let [r, g, b] = get_color(iter, self.max_iterations);
+
+            *pixel = egui::Color32::from_rgb(r, g, b);
+        });
+        println!("time elapsed:{:?}",t0.elapsed());
+        
+        self.t_mt = t0.elapsed();
+        
+        ColorImage { size: [w, h], pixels }
+    }
+
+
+
     /// Renders the *entire* image in one OpenCL dispatch.
-    fn render(&self, width: usize, height: usize, fp128: bool) -> ColorImage {
+    fn render_gpu(&mut self, width: usize, height: usize) -> ColorImage {
+        let t0 = Instant::now();
+
         let total_pixels = width * height;
         // 1) Create one big output buffer
 
@@ -215,8 +315,7 @@ impl MandelbrotApp {
             .expect("Buffer build");
         // 2) Build kernel with all args
 
-        let t0 = Instant::now();
-
+        
         
         let (center_x_hi, center_x_lo) = split_f128_to_dd(self.center.0);
         let (center_y_hi, center_y_lo) = split_f128_to_dd(self.center.1);
@@ -232,7 +331,6 @@ impl MandelbrotApp {
             .arg(center_y_lo)
             .arg(scale_lo)           // scale
             .arg(self.max_iterations as i32)
-            .arg((!fp128) as i32)
             .build()
             .expect("Kernel build");
         // 3) Enqueue it over the full 2D range
@@ -254,11 +352,24 @@ impl MandelbrotApp {
                 egui::Color32::from_rgb(r,g,b)
             })
             .collect();
-            
-        println!("time elapsed:{:?}",t0.elapsed());
 
+        println!("time elapsed:{:?}",t0.elapsed());
+        
+        self.t_gpu = t0.elapsed();
+        
         ColorImage { size: [width, height], pixels }
         
+    }
+
+    fn render(&mut self, w: usize, h:usize ) -> ColorImage{
+        //avoid overloading
+        if self.t_gpu > self.t_mt {
+            //render with multi-thread CPU
+            return self.render_mt(w, h);
+        }else{
+            //render with GPU
+            return self.render_mt(w, h);
+        }
     }
 }
 
@@ -266,17 +377,6 @@ impl MandelbrotApp {
 
 impl App for MandelbrotApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        
-         // 1) Check idle time BEFORE drawing anything
-        let now = Instant::now();
-        let since_scroll = now.duration_since(self.last_scroll);
-        let since_drag   = now.duration_since(self.last_drag);
-        // If 2 seconds have passed since *either* event, and we haven't yet re-rendered,
-        // drop the texture so that the next frame will re-run the kernel.
-        if (since_scroll >= Duration::from_secs(2) || since_drag >= Duration::from_secs(2)) && !self.render_after_idle{
-            self.texture = None;
-            self.render_after_idle = true;
-        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let available_size = egui::Vec2::new(512.0, 512.0);
@@ -307,17 +407,14 @@ impl App for MandelbrotApp {
             // Mandelbrot rendering
             // Redraw image if window size changes or parameters change
             if self.texture.is_none() || self.texture.as_ref().unwrap().size() != size {
-                let img = self.render(size[0], size[1], self.render_after_idle);
+                let img = self.render(size[0], size[1]);
                 self.texture = Some(ui.ctx().load_texture("mandelbrot", img, Default::default()));
             }
 
             if let Some(tex) = &self.texture {
-                let response = ui.image(tex);
-                
+                let response = ui.image(tex);              
                 let mut need_redraw = false;
 
-                
-                
                 // Pan with arrow keys (always available)
                 let pan_speed = f128::from(0.05) / self.zoom;
                 ctx.input(|i| {
@@ -372,8 +469,6 @@ impl App for MandelbrotApp {
                                 self.center.1 = mouse_im - (rel_y - f128::from(0.5)) * new_scale;
                                 
                                 need_redraw = true;
-                                self.last_scroll = Instant::now();
-                                self.render_after_idle = false;
                             }
                         }
                 } else {
@@ -385,8 +480,6 @@ impl App for MandelbrotApp {
                         self.center.0 -= f128::from(drag_x) / f128::from(size[0]) as f128 * scale;
                         self.center.1 -= f128::from(drag_y) / f128::from(size[1]) * scale;
                         need_redraw = true;
-                        self.last_drag = Instant::now();
-                        self.render_after_idle = false;
                     }
                 }
                 

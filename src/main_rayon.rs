@@ -21,21 +21,6 @@ impl Default for MandelbrotApp {
     }
 }
 
-fn mandelbrot(c_re: f64, c_im: f64, max_iter: u32) -> u32 {
-    let (mut z_re, mut z_im, mut iter) = (0.0, 0.0, 0);
-    let (mut z_re2, mut z_im2) = (0.0, 0.0);
-    while z_re2 + z_im2 <= 4.0 && iter < max_iter {
-        let new_re = z_re2 - z_im2 + c_re;
-        let new_im = 2.0 * z_re * z_im + c_im;
-        z_re = new_re;
-        z_im = new_im;
-        z_re2 = z_re * z_re;
-        z_im2 = z_im * z_im;
-        iter += 1;
-    }
-    iter
-}
-
 fn get_color(iter: u32, max_iter: u32) -> [u8; 3] {
     if iter == max_iter {
         return [0, 0, 0];
