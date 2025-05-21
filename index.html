@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mandelbrot Web</title>
+    <style>
+        html, body {
+            overflow: hidden; /* Prevent scrollbars */
+            margin: 0;
+            padding: 0;
+            background-color: #1a1a1a; /* Dark background similar to egui */
+            height: 100%;
+        }
+        canvas {
+            display: block; /* Remove extra space below canvas */
+            width: 100%;
+            height: 100%;
+            touch-action: none; /* Disable default touch actions to prevent zooming/panning on mobile */
+        }
+    </style>
+</head>
+<body>
+    <canvas id="the_canvas"></canvas>
+    <script type="module">
+        // Import the `init` function from your generated WASM package.
+        // Replace `your_crate_name` with the actual name of your crate from Cargo.toml.
+        import init from './pkg/mandelbrot_explorer.js'; 
+
+        async function run() {
+            // Initialize the WASM module
+            await init();
+        }
+
+        run();
+    </script>
+</body>
+</html>

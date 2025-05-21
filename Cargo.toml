@@ -1,16 +1,34 @@
 [package]
-name = "mandelbrot"
+name = "mandelbrot_explorer"
 version = "0.1.0"
 edition = "2021"
-build = "build.rs"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-eframe = "0.31.1"
-rayon = "1.7"
-ocl = "0.19"
-num-traits = "0.2"
+# Conditionally include ocl only for non-wasm32 targets
+ocl = { version = "0.19", optional = true } # Make ocl optional
+egui = "0.31.1"
+eframe = { version = "0.31.1", features = ["accesskit", "persistence"] }
+rayon = "1.10" # For multi-threaded CPU rendering
+bytemuck = "1.13"
 
-[build-dependencies]
-cc = "1.0"
+# Web-specific dependencies (only for wasm target)
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+eframe = { version = "0.31.1" } # No explicit "web" feature needed
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = ['HtmlCanvasElement', 'Window', 'Document', 'Element', 'console'] }
+console_error_panic_hook = "0.1.7"
+
+# Enable ocl only for non-wasm32 targets
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ocl = { version = "0.19" }
+
+# This is crucial for the original ocl dependency
+# We will use this to conditionally compile the ocl related code in main.rs
+# on non-wasm32 builds.
+[features]
+default = ["ocl-gpu"] # Enable ocl-gpu by default for native builds
+ocl-gpu = [] # Create a dummy feature that will be enabled when ocl is present
+
+
+[lib]
+crate-type = ["cdylib", "rlib"]
