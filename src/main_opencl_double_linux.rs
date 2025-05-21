@@ -1,10 +1,10 @@
-#![feature(f128)]
 use ocl::{ProQue, Buffer};
 use egui::ColorImage;
 use eframe::{egui, App};
 use std::sync::{Arc};
 use std::time::{Instant, Duration};
-use std::f128;
+use f128::f128;
+use num_traits::ToPrimitive;
 use rayon::prelude::*;
 use std::mem;
 
@@ -201,14 +201,15 @@ fn f128_cmp(a: f128, b: f128) -> i32 {
 
 
 fn mandelbrot_mt(c_re: f128, c_im: f128, max_iter: i32) -> i32 {
-    let mut z_re = 0.0;
-    let mut z_im = 0.0;
+    let mut z_re = f128::from(0.0);
+    let mut z_im = f128::from(0.0);
     let mut iter = 0 as i32;
-    let mut z_re2 = 0.0;
-    let mut z_im2 = 0.0;
+    let mut z_re2 = f128::from(0.0);
+    let mut z_im2 = f128::from(0.0);
+    let four = f128::from(4.0);
 
     
-    while (z_re2 + z_im2 < 4.0 as f128) && (iter < max_iter) {
+    while ((f128_cmp(z_re2 + z_im2,four)) < 0) && (iter < max_iter) {
         let new_re = z_re2 - z_im2 + c_re;
         let z_reim = z_re * z_im;
         let new_im =  z_reim + z_reim + c_im;
@@ -243,10 +244,11 @@ pub struct MandelbrotApp {
 }
 
 fn split_f128_to_dd(val: f128) -> (f64, f64) {
-    let hi = val as f64; // Convert to f64, losing precision
-    let lo = (val - hi as f128) as f64; // Remainder as low part
+    let hi = val.to_f64().unwrap_or(0.0); // Convert to f64, losing precision
+    let lo = (val - f128::from(hi)).to_f64().unwrap_or(0.0); // Remainder as low part
     (hi, lo)
 }
+
 
 impl MandelbrotApp {
     pub fn new() -> Self {
@@ -257,8 +259,8 @@ impl MandelbrotApp {
          
         
         Self {
-            center: (-0.5, 0.0),
-            zoom: 1.0,
+            center: (f128::from(-0.5), f128::from(0.0)),
+            zoom: f128::from(1.0),
             texture: None,
             max_iterations: 2048,
             pro_que: Arc::new(pro_que),
@@ -271,8 +273,8 @@ impl MandelbrotApp {
     fn render_mt(&mut self, w: usize, h:usize) -> ColorImage {
         let t0 = Instant::now();
         
-        let scale = 4.0 / self.zoom;
-        println!("scale:{:}",scale as f64);
+        let scale = f128::from(4.0) / self.zoom;
+        println!("scale:{:}",scale);
         let n_threads = rayon::current_num_threads();
         println!("Rayon will run {} threads in parallel.", n_threads);
 
@@ -284,8 +286,8 @@ impl MandelbrotApp {
             let x = i % w;
             let y = i / w;
 
-            let re = self.center.0 + (x as f128 / (w as f128) - 0.5) * scale;
-            let im = self.center.1 + (y as f128 / (h as f128) - 0.5) * scale;
+            let re = self.center.0 + (f128::from(x) / f128::from(w) - f128::from(0.5)) * scale;
+            let im = self.center.1 + (f128::from(y) / f128::from(h) - f128::from(0.5)) * scale;
 
             let iter = mandelbrot_mt(re, im, self.max_iterations);
 
@@ -293,7 +295,7 @@ impl MandelbrotApp {
 
             *pixel = egui::Color32::from_rgb(r, g, b);
         });
-        println!("time elapsed Multithread:{:?}",t0.elapsed());
+        println!("time elapsed:{:?}",t0.elapsed());
         
         self.t_mt = t0.elapsed();
         
@@ -320,7 +322,7 @@ impl MandelbrotApp {
         
         let (center_x_hi, center_x_lo) = split_f128_to_dd(self.center.0);
         let (center_y_hi, center_y_lo) = split_f128_to_dd(self.center.1);
-        let (scale_hi, scale_lo)       = split_f128_to_dd(4.0 / self.zoom);
+        let (scale_hi, scale_lo)       = split_f128_to_dd(f128::from(4.0) / self.zoom);
         let kernel = self.pro_que.kernel_builder("mandelbrot_dd")
             .arg(&buffer)
             .arg(width as i32)
@@ -354,7 +356,7 @@ impl MandelbrotApp {
             })
             .collect();
 
-        println!("time elapsed GPU:{:?}",t0.elapsed());
+        println!("time elapsed:{:?}",t0.elapsed());
         
         self.t_gpu = t0.elapsed();
         
@@ -395,12 +397,12 @@ impl App for MandelbrotApp {
                 
                 ui.separator();
                 
-                ui.label(format!("Zoom: {:.2}x", self.zoom as f64));
-                ui.label(format!("Center: ({:.6}, {:.6})", self.center.0 as f64, self.center.1 as f64));
+                ui.label(format!("Zoom: {:.2}x", self.zoom.to_f64().unwrap()));
+                ui.label(format!("Center: ({:.6}, {:.6})", self.center.0.to_f64().unwrap(), self.center.1.to_f64().unwrap()));
                 
                 if ui.button("Reset View").clicked() {
-                    self.center = (-0.5, 0.0);
-                    self.zoom = 1.0;
+                    self.center = (f128::from(-0.5), f128::from(0.0));
+                    self.zoom = f128::from(1.0);
                     self.texture = None;
                 }
             });
@@ -417,7 +419,7 @@ impl App for MandelbrotApp {
                 let mut need_redraw = false;
 
                 // Pan with arrow keys (always available)
-                let pan_speed = 0.05 / self.zoom;
+                let pan_speed = f128::from(0.05) / self.zoom;
                 ctx.input(|i| {
                     if i.key_pressed(egui::Key::ArrowLeft) {
                         self.center.0 -= pan_speed;
@@ -454,20 +456,20 @@ impl App for MandelbrotApp {
                         if is_hovered {
                             
                                 // Calculate position in fractal space before zoom
-                                let rel_x = ((pointer_pos.x - ui.min_rect().left()) / available_size.x) as f128;
-                                let rel_y = ((pointer_pos.y - ui.min_rect().top()) / available_size.y) as f128;
-                                let scale = 4.0 / self.zoom;
+                                let rel_x = f128::from((pointer_pos.x - ui.min_rect().left()) / available_size.x);
+                                let rel_y = f128::from((pointer_pos.y - ui.min_rect().top()) / available_size.y);
+                                let scale = f128::from(4.0) / self.zoom;
                                 let mouse_re = self.center.0 + (rel_x - f128::from(0.5)) * scale;
                                 let mouse_im = self.center.1 + (rel_y - f128::from(0.5)) * scale;
                                 
                                 // Apply zoom
-                                let zoom_delta = 1.1f64.powf(scroll_delta_y as f64 * 0.1) as f128;
-                                self.zoom *= zoom_delta;
+                                let zoom_delta = 1.1f64.powf(scroll_delta_y as f64 * 0.1);
+                                self.zoom *= f128::from(zoom_delta);
                                 
                                 // Adjust center to keep mouse position fixed on the same fractal point
-                                let new_scale = 4.0 / self.zoom;
-                                self.center.0 = mouse_re - (rel_x - 0.5) * new_scale;
-                                self.center.1 = mouse_im - (rel_y - 0.5) * new_scale;
+                                let new_scale = f128::from(4.0) / self.zoom;
+                                self.center.0 = mouse_re - (rel_x - f128::from(0.5)) * new_scale;
+                                self.center.1 = mouse_im - (rel_y - f128::from(0.5)) * new_scale;
                                 
                                 need_redraw = true;
                             }
@@ -476,10 +478,10 @@ impl App for MandelbrotApp {
                     // Not scrolling
 
                     if (drag_x != 0.0 || drag_y != 0.0) &&  ctx.input(|i| i.pointer.is_decidedly_dragging()) {
-                        let scale = 4.0 / self.zoom;
+                        let scale = f128::from(4.0) / self.zoom;
                         // Convert f32 drag values to f64 for calculation
-                        self.center.0 -= drag_x as f128 / size[0] as f128 * scale;
-                        self.center.1 -= drag_y as f128 / size[1] as f128 * scale;
+                        self.center.0 -= f128::from(drag_x) / f128::from(size[0]) * scale;
+                        self.center.1 -= f128::from(drag_y) / f128::from(size[1]) * scale;
                         need_redraw = true;
                     }
                 }
